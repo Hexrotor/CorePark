@@ -30,6 +30,8 @@ struct CPU
     int freq;
     int maxFreq;
     int minFreq;
+    int justStopped;
+    int justStarted;
     struct CPU_STAT stat;
 };
 
@@ -54,10 +56,13 @@ int getCoreCount() {
 
 struct CPU** initCPU(size_t coreCount) {
     struct CPU** cpuList = (struct CPU**)malloc(sizeof(struct CPU*) * coreCount);
+    memset(cpuList, 0, sizeof(struct CPU*) * coreCount);
     for(int i = 0; i < coreCount; i++) {
         struct CPU* cpu = (struct CPU*)malloc(sizeof(struct CPU));
+        memset(cpu, 0, sizeof(struct CPU));
         cpu->cpuid = i;
         cpu->usage = 0;
+        cpu->justStopped = 0;
         cpuList[i] = cpu;
     }
     return cpuList;
@@ -135,9 +140,11 @@ void controlCore(struct CPU *cpu, int request) {
             {
             case OFFLINE:
                 fprintf(f, "0");
+                cpu->justStopped = 1;
                 break;
             case ONLINE:
                 fprintf(f, "1");
+                cpu->justStarted = 1;
                 break;
             case QUERY_ONLINE_STATUS:
                 fscanf(f, "%d", &cpu->online);
@@ -216,24 +223,27 @@ void dynamicCoreControl(struct CPU** cpuList, size_t coreCount) {
     printf("AvgUsage=%.2f%%\n", AvgUsage*100);
 
     int pCoreAllOnline = 1;
-    int maxCurFreq = 0;
-    float maxCPUFreqPercentage = 0;
+    int minCurFreq = 999999999;
+    float minCPUFreqPercentage = 0;
     for(int i = 0; i < E_CORE_START; i++) {
-        // Find the greatest freq and calculate the freq percentage
-        if(cpuList[i]->freq > maxCurFreq) {
-            maxCPUFreqPercentage = (float)(cpuList[i]->freq - cpuList[i]->minFreq) / (cpuList[i]->maxFreq - cpuList[i]->minFreq);
-            maxCurFreq = cpuList[i]->freq;
+        if(cpuList[i]->online && cpuList[i]->freq < minCurFreq) {
+            minCPUFreqPercentage = (float)(cpuList[i]->freq - cpuList[i]->minFreq) / (cpuList[i]->maxFreq - cpuList[i]->minFreq);
+            minCurFreq = cpuList[i]->freq;
         }
         if(cpuList[i]->online == 0) {
             pCoreAllOnline = 0;
         }
     }
     //For test
-    //pCoreAllOnline = 1;
+    //pCoreAllOnline = 0;
 
     //Control P Core
     for(int i = E_CORE_START - 1; i >= 1; i--) {
-        if(cpuList[i]->online == 1 && cpuList[i]->usage < 0.10 && AvgUsage < 0.3) {
+        if(cpuList[i]->online == 1 && (cpuList[i]->freq == minCurFreq && cpuList[i]->usage < 0.01 && AvgUsage < 0.3)) {
+            if(cpuList[i]->justStarted) {
+                cpuList[i]->justStarted = 0;
+                continue;
+            }
             printf("Disabling P core cpu%d \n", i);
             controlCore(cpuList[i], OFFLINE);
             cpuList[i]->usage = 0;
@@ -245,34 +255,52 @@ void dynamicCoreControl(struct CPU** cpuList, size_t coreCount) {
     //Control E Core
     for(int i = coreCount - 1; i >= E_CORE_START; i--) {
         if(!pCoreAllOnline && cpuList[i]->online == 1) {
+            if(cpuList[i]->justStarted) {
+                cpuList[i]->justStarted = 0;
+                continue;
+            }
             printf("Disabling E core cpu%d \n", i);
             controlCore(cpuList[i], OFFLINE);
             cpuList[i]->usage = 0;
             cpuList[i]->freq = 0;
-        } else if(cpuList[i]->online == 1 && cpuList[i]->usage < 0.07) {
+            break;
+        } else if(cpuList[i]->online == 1 && cpuList[i]->usage < 0.01) {
+            if(cpuList[i]->justStarted) {
+                cpuList[i]->justStarted = 0;
+                continue;
+            }
             printf("Disabling E core cpu%d \n", i);
             controlCore(cpuList[i], OFFLINE);
             cpuList[i]->usage = 0;
             cpuList[i]->freq = 0;
+            break;
         }
     }
 
     //P Core is start from cpu0 to cpu[E_CORE_START - 1], E Core is start from cpu[E_CORE_START] to cpu[coreCount - 1]
     //If P core is all online, considering use E core
     
-    if(AvgUsage > 0.8 && pCoreAllOnline) {
+    if(AvgUsage > 0.3 && pCoreAllOnline && minCPUFreqPercentage > 0.1) {
         for(int i = E_CORE_START; i < coreCount; i++) {
             if(cpuList[i]->online == 0) {
+                if(cpuList[i]->justStopped) {
+                    cpuList[i]->justStopped = 0;
+                    continue;
+                }
                 printf("Enabling E core cpu%d \n", i);
                 controlCore(cpuList[i], ONLINE);
                 break;
             }
         } 
     }
-    // I don't know why I considered the maxCPUFreqPercentage>0.8, maybe it's wrong
-    if(AvgUsage > 0.3 && maxCPUFreqPercentage > 0.8) {
+
+    if(minCPUFreqPercentage > 0.1) {
         for(int i = 1; i < E_CORE_START; i++) {
             if(cpuList[i]->online == 0) {
+                if(cpuList[i]->justStopped) {
+                    cpuList[i]->justStopped = 0;
+                    continue;
+                }
                 printf("Enabling P core cpu%d \n", i);
                 controlCore(cpuList[i], ONLINE);
                 break;
